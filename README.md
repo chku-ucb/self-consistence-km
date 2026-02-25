@@ -1,4 +1,4 @@
-# Self-Consistence KM
+# Self-consistence-km: Numerical simulations and analytical framework for higher-order kuramoto models.
 
 ## Prerequisites & Setup
 
