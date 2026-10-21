@@ -39,7 +39,12 @@ Below is a brief overview of the main experimental scripts in this repository. T
     This file is for the experiment for validating the change of the subcritical point depending on the triadic interaction structure. 
 
 *   **`utils.jl`**
-    This heavily-documented utility file sets up the shared configurations, basic math functions, Chung-Lu and configuration models for network generations, and Runge-Kutta numerical integration steps used by the above experimental scripts.
+    This heavily-documented utility file sets up the shared configurations, basic math functions, Chung-Lu and configuration models for network generations, and Runge-Kutta numerical integration steps used by the above experimental scripts. Main components:
+    *   **Network generation:** Chung-Lu graphs and 3-uniform hyperedges (triangles) use the Miller-Hagberg geometric-skip algorithm (Miller & Hagberg, WAW 2011), giving O(N + M) expected time for pairwise edges and O(N² + M₃) for triangles instead of O(N²) and O(N³). Configuration-model generators (`create_L_CF`, `create_3D_CF`) are also provided.
+    *   **Critical couplings:** `Un_gen` computes the leading eigenpair of the adjacency matrix by sparse power iteration on the adjacency list, so no dense N×N matrix is built. `den_cal` and `num_cal` give the eigenvector-based K3 threshold, and `K3crit_HMF` gives the heterogeneous mean-field (HMF) estimate.
+    *   **Simulation:** `RK4_step_fast!` (optionally with pre-allocated `caches`), `evolve_RK4!` (integrates at fixed K2, K3 and returns the time-averaged R), `RK4_step` and `Heun_step`.
+    *   **Self-consistent theory:** `R1_th_Int` (FDA), `R1_th_sum` (TAT on the actual frequency sample) and `hmf_fixed_point` / `compute_HMF_sweep` (HMF forward/backward sweeps). All are solved by damped fixed-point iteration with a convergence tolerance.
+    *   **Rewiring:** `rewire_3D_Ω` swaps hyperedge vertices to raise or lower K3crit while preserving the triadic degree sequence.
 
 ## Running the Code
 

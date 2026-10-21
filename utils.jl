@@ -7,101 +7,175 @@ const K2C = 2.0;
 #################### UTILITIES ####################
 
 """
-    function CDF_power_bound(x::Float64, lwbd::Int64, upbd::Int64, γ::Float64)
+    CDF_power_bound(x, lwbd, upbd, γ)
 
-Calculate the inverse Cumulative Distribution Function (CDF) for a bounded power-law distribution.
-Applies the transformation using `@.` for element-wise operation support.
+Inverse CDF of a bounded power-law distribution on `[lwbd, upbd]` with exponent `γ`.
+Maps `x ~ U(0,1)` to a power-law sample (`@.` gives element-wise support).
 """
 @. function CDF_power_bound(x::Float64, lwbd::Int64, upbd::Int64, γ::Float64)
     return ((upbd^(1 - γ) - lwbd^(1 - γ)) * x + lwbd^(1 - γ))^(1 / (1 - γ))
 end
 
 """
-    function CDF_pow_all(x::Float64, γ::Float64, mean_deg::Union{Int,Int32})
+    CDF_pow_all(x, γ, mean_deg)
 
-Calculate the inverse CDF for a power-law distribution given a mean degree.
-Used to generate random degrees following a power-law distribution.
+Inverse CDF of an unbounded power-law distribution with exponent `γ` whose
+minimum is chosen so that the mean degree is `mean_deg`.
 """
 @. function CDF_pow_all(x::Float64, γ::Float64, mean_deg::Union{Int,Int32})
     return mean_deg * (γ - 2) / (γ - 1) * x^(1 / (1 - γ))
 end
 
 """
-    function safe_sqrt(x::Float64)
+    safe_sqrt(x)
 
-Safe square root that returns `0.0` for negative values to prevent domain errors.
+Square root that returns `0.0` for non-positive `x` to avoid domain errors.
 """
 @. function safe_sqrt(x::Float64)
     return x > 0.0 ? sqrt(x) : 0.0
 end
 
 """
-    function safe_log(x::Float64)
+    safe_log(x)
 
-Safe natural logarithm that returns `0.0` for zero or negative values.
+Natural logarithm that returns `0.0` for non-positive `x`.
 """
 @. function safe_log(x::Float64)
     return x > 0.0 ? log(x) : 0.0
 end
 
 """
-    function safe_div(x::Float64, y::Float64)
+    safe_div(x, y)
 
-Safe division that returns `0.0` if the denominator is zero or less, avoiding division by zero.
+Division that returns `0.0` when the denominator `y` is non-positive.
 """
 @. function safe_div(x::Float64, y::Float64)
     return y > 0.0 ? x / y : 0.0
 end
 
 """
-    function CDF_power(x::Float64, lwbd::Int64, upbd::Int64, γ::Float64)
+    CDF_power(x, lwbd, upbd, γ)
 
-Calculate the inverse CDF for a bounded power-law distribution (scalar version).
+Scalar version of [`CDF_power_bound`](@ref).
 """
 function CDF_power(x::Float64, lwbd::Int64, upbd::Int64, γ::Float64)
     return ((upbd^(1 - γ) - lwbd^(1 - γ)) * x + lwbd^(1 - γ))^(1 / (1 - γ))
 end
 
+"""
+    vec_to_matrix(Adj_vec) -> Vector{Matrix{Int16}}
+
+Convert a vector-of-tuples adjacency representation into a vector-of-matrices
+representation used by the 3D Kuramoto solver. Shared helper to avoid code
+duplication in `create_3D`, `create_3D_CF`, and `rewire_3D_Ω`.
+"""
+function vec_to_matrix(Adj_vec::Vector{Vector{Tuple{Int16,Int16}}}, n::Int)
+    Adj = Vector{Matrix{Int16}}(undef, n)
+    @inbounds for i in 1:n
+        len = length(Adj_vec[i])
+        M = Matrix{Int16}(undef, len, 2)
+        for idx in 1:len
+            M[idx, 1] = Adj_vec[i][idx][1]
+            M[idx, 2] = Adj_vec[i][idx][2]
+        end
+        Adj[i] = M
+    end
+    return Adj
+end
+
 ###################### NETWORK GENERATION ######################
+# All Chung-Lu generators use the Miller-Hagberg O(N+M) algorithm.
+# Reference: Miller & Hagberg, "Efficient Generation of Networks with
+#            Given Expected Degrees", WAW 2011 (LNCS 6732, pp. 115-126).
+#
+# Core idea: sort weights in decreasing order, then for each source node u
+# use a Geometric distribution to skip non-edges, jumping directly to the
+# next edge candidate.  The acceptance/rejection step corrects for the
+# varying probability across the sorted sequence.
 
-#Chung-Lu methods
 """
-    function create_L_CL_UN(n::Int, lwbd::Int, upbd::Int)
+    fast_CL(n, target) -> Vector{Vector{Int32}}
 
-Create a 2D network using the Chung-Lu method with a uniform degree distribution target.
-Generates an adjacency list, the empirical degrees, and the target degrees.
+Generate a Chung-Lu random graph on `n` nodes with expected-degree sequence
+`target` in O(N+M) expected time using the Miller-Hagberg geometric-skip
+algorithm.  Returns the adjacency list (undirected, no self-loops).
 """
-function create_L_CL_UN(n::Int, lwbd::Int, upbd::Int)
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
-    target = rand(lwbd:upbd, n)
-    sum_deg = sum(target)
+function fast_CL(n::Int, target::AbstractVector{<:Real})
+    Adj = [Int32[] for _ in 1:n]
+    W = Float64(sum(target))
+    if W == 0.0 || n == 0
+        return Adj
+    end
 
-    for i in 1:n
-        for j in i+1:n
-            prob = target[i] * target[j] / sum_deg
-            if rand() < prob
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
+    rho = 1.0 / W
+    order = sortperm(target, rev=true)
+    seq = target[order]
+
+    for u in 1:(n-1)
+        v = u + 1
+        factor = Float64(seq[u]) * rho
+        p = min(Float64(seq[v]) * factor, 1.0)
+        
+        while v <= n && p > 0.0
+            if p != 1.0
+                r = rand()
+                v += floor(Int, log(r) / log1p(-p))
+            end
+            if v <= n
+                q = min(Float64(seq[v]) * factor, 1.0)
+                if rand() < q / p
+                    orig_u = order[u]
+                    orig_v = order[v]
+                    push!(Adj[orig_u], Int32(orig_v))
+                    push!(Adj[orig_v], Int32(orig_u))
+                end
+                v += 1
+                p = q
             end
         end
     end
+    return Adj
+end
+
+"""Chung-Lu graph with uniform target degrees drawn from `lwbd:upbd`."""
+function create_L_CL_UN(n::Int, lwbd::Int, upbd::Int)
+    target = rand(lwbd:upbd, n)
+    Adj = fast_CL(n, target)
     degree = [length(Adj[i]) for i in 1:n]
     return Adj, degree, target
 end
 
-"""
-    function create_L_CL_ER(n::Int, mean_deg::Int)
+"""Chung-Lu graph with uniform target degrees drawn from `lwbd:upbd`, sorted
+ascending so node i carries the i-th smallest target degree."""
+function create_L_CL_UN_sort(n::Int, lwbd::Int, upbd::Int)
+    target = rand(lwbd:upbd, n)
+    sort!(target)
+    Adj = fast_CL(n, target)
+    degree = [length(Adj[i]) for i in 1:n]
+    return Adj, degree, target
+end
 
-Create an Erdos-Renyi type network using the Chung-Lu method.
-"""
+"""Erdős-Rényi graph with uniform edge probability `p = mean_deg / n`,
+generated in O(N+M) time via geometric skipping."""
 function create_L_CL_ER(n::Int, mean_deg::Int)
     Adj = [Int32[] for _ in 1:n]
     p = mean_deg / n
-    for i in 1:n
-        for j in i+1:n
-            if rand() < p
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
+    if p >= 1.0
+        for i in 1:n, j in i+1:n
+            push!(Adj[i], Int32(j))
+            push!(Adj[j], Int32(i))
+        end
+    elseif p > 0.0
+        for i in 1:n
+            j = i + 1
+            while j <= n
+                r = rand()
+                j += floor(Int, log(r) / log1p(-p))
+                if j <= n
+                    push!(Adj[i], Int32(j))
+                    push!(Adj[j], Int32(i))
+                    j += 1
+                end
             end
         end
     end
@@ -109,101 +183,42 @@ function create_L_CL_ER(n::Int, mean_deg::Int)
     return Adj, degree
 end
 
-"""
-    function create_L_CL_PL_bound(n::Int, γ::Float64, lwbd::Int, upbd::Int)
-
-Create a network using the Chung-Lu method targeting a bounded power-law degree distribution.
-"""
+"""Chung-Lu graph with power-law target degrees (bounded)."""
 function create_L_CL_PL_bound(n::Int, γ::Float64, lwbd::Int, upbd::Int)
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
     target = [round(Int32, CDF_power_bound(rand(Uniform(0.0, 1.0)), lwbd, upbd, γ)) for i in 1:n]
-    sum_deg = sum(target)
-    for i in 1:n
-        for j in i+1:n
-            prob = target[i] * target[j] / sum_deg
-            if rand() < prob
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
-            end
-        end
-    end
+    Adj = fast_CL(n, target)
     degree = [length(Adj[i]) for i in 1:n]
     return Adj, degree, target
 end
 
-"""
-    function create_L_CL_PL(n::Int, γ::Float64, mean_deg::Union{Int,Int32})
-
-Create a network using the Chung-Lu method targeting a standard power-law distribution.
-"""
+"""Chung-Lu graph with power-law target degrees (unbounded)."""
 function create_L_CL_PL(n::Int, γ::Float64, mean_deg::Union{Int,Int32})
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
     target = [round(Int32, CDF_pow_all(rand(Uniform(0.0, 1.0)), γ, mean_deg)) for i in 1:n]
-    sum_deg = sum(target)
-    for i in 1:n
-        for j in i+1:n
-            prob = target[i] * target[j] / sum_deg
-            if rand() < prob
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
-            end
-        end
-    end
+    Adj = fast_CL(n, target)
     degree = [length(Adj[i]) for i in 1:n]
     return Adj, degree, target
 end
 
-"""
-    function create_L_CL_NP(n::Int, Np::Int, ps::Vector{Int})
-
-Create a network using the Chung-Lu method with target degrees chosen uniformly from a provided specific degree set.
-"""
+"""Chung-Lu graph with target degrees drawn from a discrete set `ps`."""
 function create_L_CL_NP(n::Int, Np::Int, ps::Vector{Int})
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
     target = [ps[rand(1:Np)] for _ in 1:n]
-    sum_deg = sum(target)
-    for i in 1:n
-        for j in i+1:n
-            if rand() < target[i] * target[j] / sum_deg
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
-            end
-        end
-    end
+    Adj = fast_CL(n, target)
     degree = [length(Adj[i]) for i in 1:n]
     return Adj, degree, target
 end
 
-"""
-    function create_L_CL(n::Int, target::Vector{Int})
-
-Create a network using the Chung-Lu method with a previously specified target degree distribution.
-"""
+"""Chung-Lu graph with an explicit target degree sequence."""
 function create_L_CL(n::Int, target::Vector{Int})
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
-    sum_deg = sum(target)
-    for i in 1:n
-        for j in i+1:n
-            prob = target[i] * target[j] / sum_deg
-            if rand() < prob
-                push!(Adj[i], Int32(j))
-                push!(Adj[j], Int32(i))
-            end
-        end
-    end
+    Adj = fast_CL(n, target)
     degree = [length(Adj[i]) for i in 1:n]
     return Adj, degree, target
 end
 
 #Configuration model
 
-"""
-    function create_L_CF(n::Int, target::Vector{Int})
-
-Create a 2D network using the Configuration Model matching a given target degree sequence.
-"""
+"""Configuration model: stub-matching with retry loop (up to 1000 rounds)."""
 function create_L_CF(n::Int, target::Vector{Int})
-    Adj = [Int32[] for _ in 1:n]  # Initialize as Vector{Vector{Int32}}
+    Adj = [Int32[] for _ in 1:n]
 
     if sum(target) % 2 != 0
         target[rand(1:n)] += 1
@@ -212,6 +227,7 @@ function create_L_CF(n::Int, target::Vector{Int})
     remain_stubs = copy(target)
     while any(remain_stubs .> 0) && rd < 1000
         current_stubs = Int32[]
+        sizehint!(current_stubs, sum(remain_stubs))
         for i in 1:n
             for _ in 1:remain_stubs[i]
                 push!(current_stubs, Int32(i))
@@ -239,50 +255,63 @@ function create_L_CF(n::Int, target::Vector{Int})
 end
 
 ################## Triangle generation ##################
-"""
-    function create_3D(n::Int, target::Union{Vector{Int},Vector{Int32}})
 
-Generate a 3D (simplicial) network by creating triangles with probability proportional to the product of triplet target degrees.
+"""
+    create_3D(n, target) -> (Adj, degree)
+
+Generate 3-uniform hyperedges (triangles) using the Chung-Lu model with
+Miller-Hagberg geometric skipping on the innermost loop.
+
+Complexity: O(N² + M₃) expected time, where M₃ is the number of hyperedges.
+This is a dramatic improvement over the naïve O(N³) triple-nested loop.
 """
 function create_3D(n::Int, target::Union{Vector{Int},Vector{Int32}})
-    Adj = [Matrix{Int16}(undef, 0, 2) for _ in 1:n]
-    sumdeg = sum(target)
-    for i in 1:n
-        for j in i+1:n
-            for k in j+1:n
-                prob = 2 * target[i] * target[j] * target[k] / sumdeg^2
-                if rand() < prob
-                    # Create new rows to add to Adj[i], Adj[j], and Adj[k]
-                    new_row_i = reshape(Int16[j k], 1, 2)
-                    new_row_i2 = reshape(Int16[k j], 1, 2)
-                    new_row_j = reshape(Int16[i k], 1, 2)
-                    new_row_j2 = reshape(Int16[k i], 1, 2)
-                    new_row_k = reshape(Int16[i j], 1, 2)
-                    new_row_k2 = reshape(Int16[j i], 1, 2)
-
-                    # Append the new rows to the matrices
-                    Adj[i] = vcat(Adj[i], new_row_i)
-                    Adj[i] = vcat(Adj[i], new_row_i2)
-                    Adj[j] = vcat(Adj[j], new_row_j)
-                    Adj[j] = vcat(Adj[j], new_row_j2)
-                    Adj[k] = vcat(Adj[k], new_row_k)
-                    Adj[k] = vcat(Adj[k], new_row_k2)
+    Adj_vec = [Tuple{Int16, Int16}[] for _ in 1:n]
+    sumdeg = Float64(sum(target))
+    
+    if sumdeg > 0.0 && n >= 3
+        order = sortperm(target, rev=true)
+        seq = target[order]
+        
+        for i in 1:(n-2)
+            for j in (i+1):(n-1)
+                factor = 2.0 * Float64(seq[i]) * Float64(seq[j]) / (sumdeg * sumdeg)
+                k = j + 1
+                p = min(Float64(seq[k]) * factor, 1.0)
+                
+                while k <= n && p > 0.0
+                    if p != 1.0
+                        r = rand()
+                        k += floor(Int, log(r) / log1p(-p))
+                    end
+                    
+                    if k <= n
+                        q = min(Float64(seq[k]) * factor, 1.0)
+                        if rand() < q / p
+                            oi, oj, ok = order[i], order[j], order[k]
+                            push!(Adj_vec[oi], (Int16(oj), Int16(ok)))
+                            push!(Adj_vec[oi], (Int16(ok), Int16(oj)))
+                            push!(Adj_vec[oj], (Int16(oi), Int16(ok)))
+                            push!(Adj_vec[oj], (Int16(ok), Int16(oi)))
+                            push!(Adj_vec[ok], (Int16(oi), Int16(oj)))
+                            push!(Adj_vec[ok], (Int16(oj), Int16(oi)))
+                        end
+                        k += 1
+                        p = q
+                    end
                 end
             end
         end
     end
-    degree = [Int32(size(Adj[i], 1) / 2) for i in 1:n]
+    
+    Adj = vec_to_matrix(Adj_vec, n)
+    degree = [Int32(size(Adj[i], 1) ÷ 2) for i in 1:n]
     return Adj, degree
 end
 
-
-"""
-    function create_3D_CF(n::Int, target::Union{Vector{Int},Vector{Int32}})
-
-Generate a 3D (simplicial) network using a generalized Configuration Model adapted for triangles.
-"""
+"""Configuration model for 3-uniform hyperedges with stub-matching."""
 function create_3D_CF(n::Int, target::Union{Vector{Int},Vector{Int32}})
-    Adj = [Matrix{Int16}(undef, 0, 2) for _ in 1:n]
+    Adj_vec = [Tuple{Int16, Int16}[] for _ in 1:n]
     if sum(target) % 3 == 2
         target[rand(1:n)] += 1
         target[rand(1:n)] += 1
@@ -293,6 +322,7 @@ function create_3D_CF(n::Int, target::Union{Vector{Int},Vector{Int32}})
     remain_stubs = copy(target)
     while any(remain_stubs .> 0) && rd < 1000
         current_stubs = Int32[]
+        sizehint!(current_stubs, sum(remain_stubs))
         for i in 1:n
             for _ in 1:remain_stubs[i]
                 push!(current_stubs, Int32(i))
@@ -306,21 +336,12 @@ function create_3D_CF(n::Int, target::Union{Vector{Int},Vector{Int32}})
             v = current_stubs[k+1]
             w = current_stubs[k+2]
             if u != v && u != w && v != w
-                # Create new rows to add to Adj[u], Adj[v], and Adj[w]
-                new_row_u = reshape(Int16[v w], 1, 2)
-                new_row_u2 = reshape(Int16[w v], 1, 2)
-                new_row_v = reshape(Int16[u w], 1, 2)
-                new_row_v2 = reshape(Int16[w u], 1, 2)
-                new_row_w = reshape(Int16[u v], 1, 2)
-                new_row_w2 = reshape(Int16[v u], 1, 2)
-
-                # Append the new rows to the matrices
-                Adj[u] = vcat(Adj[u], new_row_u)
-                Adj[u] = vcat(Adj[u], new_row_u2)
-                Adj[v] = vcat(Adj[v], new_row_v)
-                Adj[v] = vcat(Adj[v], new_row_v2)
-                Adj[w] = vcat(Adj[w], new_row_w)
-                Adj[w] = vcat(Adj[w], new_row_w2)
+                push!(Adj_vec[u], (Int16(v), Int16(w)))
+                push!(Adj_vec[u], (Int16(w), Int16(v)))
+                push!(Adj_vec[v], (Int16(u), Int16(w)))
+                push!(Adj_vec[v], (Int16(w), Int16(u)))
+                push!(Adj_vec[w], (Int16(u), Int16(v)))
+                push!(Adj_vec[w], (Int16(v), Int16(u)))
 
                 remain_stubs[u] -= 1
                 remain_stubs[v] -= 1
@@ -330,39 +351,69 @@ function create_3D_CF(n::Int, target::Union{Vector{Int},Vector{Int32}})
         end
         rd += 1
     end
-    degree = [Int32(size(Adj[i], 1) / 2) for i in 1:n]
+    
+    Adj = vec_to_matrix(Adj_vec, n)
+    degree = [Int32(size(Adj[i], 1) ÷ 2) for i in 1:n]
     return Adj, degree
 end
 
 ############### 3BD Kuramoto Coupling CONSTANT #################
 
-"""
-    function Un_gen(n::Int, degree2::Vector{Int64}, A2::Vector{Vector{Int32}})
-
-Calculate the principal eigenvector of the adjacency matrix derived from the 2nd-order adjacencies.
-"""
-function Un_gen(n::Int, degree2::Vector{Int64}, A2::Vector{Vector{Int32}})
-    Adj2 = zeros(Int32, n, n)
-    for i in 1:n
-        for j in 1:degree2[i]
-            Adj2[i, A2[i][j]] = 1
+"""Compute leading eigenvalue and eigenvector of the adjacency matrix using sparse power iteration."""
+function Un_gen(n::Int, degree2::AbstractVector, A2::AbstractVector; tol::Float64=1e-10, maxiter::Int=5000)
+    u = ones(Float64, n)
+    u ./= norm(u)
+    v = similar(u)
+    lambda_old = 0.0
+    lambda = 0.0
+    
+    for iteration in 1:maxiter
+        Threads.@threads :static for i in 1:n
+            s = 0.0
+            @inbounds for j in A2[i]
+                s += u[j]
+            end
+            v[i] = s
         end
+        lambda = dot(u, v)
+        nv = norm(v)
+        nv == 0.0 && error("Network has no edges.")
+        v ./= nv
+        if abs(lambda - lambda_old) < tol * max(1.0, abs(lambda))
+            u .= v
+            break
+        end
+        u, v = v, u
+        lambda_old = lambda
     end
-    e = eigen(Adj2)
-    return e.values[end], e.vectors[:, end]
+    
+    Threads.@threads :static for i in 1:n
+        s = 0.0
+        @inbounds for j in A2[i]
+            s += u[j]
+        end
+        v[i] = s
+    end
+    lambda = dot(u, v) / dot(u, u)
+    
+    # L2-normalize to exactly match the output of eigen()
+    u ./= norm(u)
+    
+    return lambda, u
 end
 
-"""
-    function num_cal(N, Un, Adj2)
-
-Calculate network interaction moments (numerator) based on adjacency limits and principal eigenvector elements.
-"""
+"""Compute numerator for K3c using adjacency matrix (matrix form)."""
 function num_cal(N, Un, Adj2)
+    # Vectorised: num = Uᵀ · diag(U) · A · diag(U²) · A · U
+    # kept explicit for clarity & thread safety
     num = 0.0
-    for i in 1:N
+    @inbounds for i in 1:N
         for j in 1:N
+            aij = Adj2[i, j]
+            aij == 0 && continue          # skip zero entries
+            uiuj2 = Un[i] * Un[j]^2
             for k in 1:N
-                num += Un[i] * Un[j]^2 * Un[k] * Adj2[i, j] * Adj2[j, k]
+                num += uiuj2 * Un[k] * aij * Adj2[j, k]
             end
         end
     end
@@ -370,22 +421,18 @@ function num_cal(N, Un, Adj2)
 end
 
 """
-    function num_cal(Un)
+    num_cal(Un)
 
-Calculate the sum of the fourth powers of the principal eigenvector components.
+Sum of the fourth powers of the leading-eigenvector entries, Σᵢ uᵢ⁴.
 """
 function num_cal(Un)
     return sum(Un .^ 4)
 end
 
-"""
-    function den_cal(N, deg3, A3, Un)
-
-Calculate theoretical denominator sums related to 3rd-order network coupling based on the principal eigenvector.
-"""
+"""Compute denominator for K3c using hyperedge adjacency."""
 function den_cal(N, deg3, A3, Un)
     den = 0.0
-    for i in 1:N
+    @inbounds for i in 1:N
         for j in 1:size(A3[i], 1)
             den += Un[i] * Un[A3[i][j, 1]]^2 * Un[A3[i][j, 2]]
         end
@@ -396,181 +443,226 @@ end
 ###################### 3BD Kuramoto Model ######################
 
 """
-    function dthdt(θi::Float64, ωi::Float64, Hi::Float64, ψi::Float64)
+    dthdt(θi, ωi, Hi, ψi)
 
-Calculate the phase derivative (dθ/dt) for the Kuramoto model for a single oscillator.
+Phase velocity of oscillator `i` in the local mean-field form:
+dθᵢ/dt = ωᵢ - Hᵢ sin(θᵢ - ψᵢ).
 """
-function dthdt(θi::Float64, ωi::Float64, Hi::Float64, ψi::Float64)
+@inline function dthdt(θi::Float64, ωi::Float64, Hi::Float64, ψi::Float64)
     return ωi - Hi * sin(θi - ψi)
 end
 
 """
-    function cal_order_param(K2::Float64, K3::Float64, θ::Vector{Float64}, params::Any)
+    cal_order_param(K2, K3, θ, params) -> (Hn, ψn, Rn)
 
-Compute the Kuramoto local order parameters (Hn, ψn, Rn) based on 2nd and 3rd order couplings.
+Local mean field of every node from dyadic (`K2`) and triadic (`K3`) coupling:
+Hᵢ e^{iψᵢ} = K2 Σⱼ Aᵢⱼ e^{iθⱼ} + K3 Σ_(j,k) e^{i(2θⱼ - θₖ)}.
+`Rn[i]` is the dyadic part Σⱼ Aᵢⱼ e^{iθⱼ}. Allocating version of [`cal_order_param!`](@ref).
 """
 function cal_order_param(K2::Float64, K3::Float64, θ::Vector{Float64}, params::Any)
     n, degree2, A2, degree3, A3 = params
     Hn = zeros(Float64, n)
     ψn = zeros(Float64, n)
-    Rn = zeros(Complex{Float64}, n)
+    Rn = zeros(ComplexF64, n)
     @threads :dynamic for i in 1:n
-        sum_r2, sum_r3 = 0.0 + 0.0 * 1im, 0.0 + 0.0 * 1im
+        re2, im2 = 0.0, 0.0
+        re3, im3 = 0.0, 0.0
 
-        sum_r2 = sum(exp(1im * θ[A2[i][j]]) for j in 1:degree2[i]; init=0)
+        @inbounds for j in 1:degree2[i]
+            idx = A2[i][j]
+            angle_val = θ[idx]
+            s, c = sincos(angle_val)
+            re2 += c
+            im2 += s
+        end
 
-        sum_r3 = sum(exp(1im * (2 * θ[A3[i][j, 1]] - θ[A3[i][j, 2]])) for j in 1:Int32(size(A3[i], 1)); init=0)
+        @inbounds adj3 = A3[i]
+        @inbounds for j in 1:size(adj3, 1)
+            idx1 = adj3[j, 1]
+            idx2 = adj3[j, 2]
+            angle_val = 2.0 * θ[idx1] - θ[idx2]
+            s, c = sincos(angle_val)
+            re3 += c
+            im3 += s
+        end
 
-        Comp = K2 * sum_r2 + K3 * sum_r3
-        Hn[i] = abs(Comp)
-        ψn[i] = angle(Comp)
-        Rn[i] = sum_r2
+        total_re = K2 * re2 + K3 * re3
+        total_im = K2 * im2 + K3 * im3
+
+        @inbounds Hn[i] = sqrt(total_re^2 + total_im^2)
+        @inbounds ψn[i] = atan(total_im, total_re)
+        @inbounds Rn[i] = ComplexF64(re2, im2)
     end
     return Hn, ψn, Rn
 end
 
 
 """
-    function cal_order_param!(Hn::Vector{Float64}, ψn::Vector{Float64}, Rn::Vector{ComplexF64},
+    cal_order_param!(Hn, ψn, Rn, K2, K3, θ, params)
 
-In-place, optimization-friendly calculation of the Kuramoto local order parameters.
+In-place version of [`cal_order_param`](@ref): writes into the pre-allocated `Hn`, `ψn`, `Rn`.
 """
 function cal_order_param!(Hn::Vector{Float64}, ψn::Vector{Float64}, Rn::Vector{ComplexF64},
     K2::Float64, K3::Float64, θ::Vector{Float64}, params::Any)
     n, degree2, A2, degree3, A3 = params
 
     @threads :dynamic for i in 1:n
-        # Initialize real and imaginary accumulators
         re2, im2 = 0.0, 0.0
         re3, im3 = 0.0, 0.0
 
-        # K2 Summation (2nd order)
-        # Replacing sum(exp(...)) to avoid temporary allocations
-        for j in 1:degree2[i]
+        @inbounds for j in 1:degree2[i]
             idx = A2[i][j]
             angle_val = θ[idx]
-            re2 += cos(angle_val)
-            im2 += sin(angle_val)
+            s, c = sincos(angle_val)
+            re2 += c
+            im2 += s
         end
 
-        # K3 Summation (3rd order)
-        # Replacing size(A3[i], 1) with direct access
-        adj3 = A3[i]
-        for j in 1:size(adj3, 1)
+        @inbounds adj3 = A3[i]
+        @inbounds for j in 1:size(adj3, 1)
             idx1 = adj3[j, 1]
             idx2 = adj3[j, 2]
-            angle_val = 2 * θ[idx1] - θ[idx2]
-            re3 += cos(angle_val)
-            im3 += sin(angle_val)
+            angle_val = 2.0 * θ[idx1] - θ[idx2]
+            s, c = sincos(angle_val)
+            re3 += c
+            im3 += s
         end
 
-        # Calculate final parameters in-place
         total_re = K2 * re2 + K3 * re3
         total_im = K2 * im2 + K3 * im3
 
-        # Update pre-allocated arrays
-        Hn[i] = sqrt(total_re^2 + total_im^2) # Faster than abs(complex)
-        ψn[i] = atan(total_im, total_re)      # Faster than angle(complex)
-        Rn[i] = ComplexF64(re2, im2)
+        @inbounds Hn[i] = sqrt(total_re^2 + total_im^2)
+        @inbounds ψn[i] = atan(total_im, total_re)
+        @inbounds Rn[i] = ComplexF64(re2, im2)
     end
     return nothing
 end
 
 
 """
-    function RK4_step(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
+    RK4_step(θ, ω, dt, Hn, Ψn, Rn, K2, K3, params) -> θ
 
-Perform a standard 4th-order Runge-Kutta numerical integration step for the 3BD Kuramoto phases.
+One 4th-order Runge-Kutta step of the 3-body Kuramoto model (allocates its stages).
+`Hn`, `Ψn` must hold the local field evaluated at the current `θ`.
 """
 function RK4_step(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
     n, degree2, A2, degree3, A3 = params
 
     k1 = zeros(Float64, n)
     @threads :dynamic for i in 1:n
-        k1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
+        @inbounds k1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
     end
 
-    θ_k2 = θ .+ 0.5 * dt .* k1
+    θ_k2 = θ .+ 0.5 .* dt .* k1
     H_k2, Ψ_k2, _ = cal_order_param(K2, K3, θ_k2, params)
     k2 = zeros(Float64, n)
     @threads :dynamic for i in 1:n
-        k2[i] = dthdt(θ_k2[i], ω[i], H_k2[i], Ψ_k2[i])
+        @inbounds k2[i] = dthdt(θ_k2[i], ω[i], H_k2[i], Ψ_k2[i])
     end
 
-    θ_k3 = θ .+ 0.5 * dt .* k2
+    θ_k3 = θ .+ 0.5 .* dt .* k2
     H_k3, Ψ_k3, _ = cal_order_param(K2, K3, θ_k3, params)
     k3 = zeros(Float64, n)
     @threads :dynamic for i in 1:n
-        k3[i] = dthdt(θ_k3[i], ω[i], H_k3[i], Ψ_k3[i])
+        @inbounds k3[i] = dthdt(θ_k3[i], ω[i], H_k3[i], Ψ_k3[i])
     end
 
     θ_k4 = θ .+ dt .* k3
     H_k4, Ψ_k4, _ = cal_order_param(K2, K3, θ_k4, params)
     k4 = zeros(Float64, n)
     @threads :dynamic for i in 1:n
-        k4[i] = dthdt(θ_k4[i], ω[i], H_k4[i], Ψ_k4[i])
+        @inbounds k4[i] = dthdt(θ_k4[i], ω[i], H_k4[i], Ψ_k4[i])
     end
 
     @threads :dynamic for i in 1:n
-        θ[i] += (dt / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i])
+        @inbounds θ[i] += (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
     end
 
     return θ
 end
 
 """
-    function RK4_step_fast!(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
+    RK4_step_fast!(θ, ω, dt, Hn, Ψn, Rn, K2, K3, params, caches=nothing) -> θ
 
-Perform a highly-optimized in-place 4th-order Runge-Kutta integration step for the 3BD Kuramoto phases.
+In-place RK4 step. Pass `caches = (H_k, Ψ_k, k1, k2, k3, k4, θ_tmp)` (seven length-`n`
+`Float64` vectors) to avoid allocating them every step; with `caches = nothing` they are
+allocated on each call. `Hn`, `Ψn` must hold the local field evaluated at the current `θ`.
 """
-function RK4_step_fast!(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
+function RK4_step_fast!(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any, caches=nothing)
     n, degree2, A2, degree3, A3 = params
 
-    H_k2 = zeros(Float64, n)
-    H_k3 = zeros(Float64, n)
-    H_k4 = zeros(Float64, n)
-    Ψ_k2 = zeros(Float64, n)
-    Ψ_k3 = zeros(Float64, n)
-    Ψ_k4 = zeros(Float64, n)
-
-    k1 = zeros(Float64, n)
-    @threads :dynamic for i in 1:n
-        k1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
-    end
-
-    θ_k2 = θ .+ 0.5 * dt .* k1
-    cal_order_param!(H_k2, Ψ_k2, Rn, K2, K3, θ_k2, params)
-    k2 = zeros(Float64, n)
-    @threads :dynamic for i in 1:n
-        k2[i] = dthdt(θ_k2[i], ω[i], H_k2[i], Ψ_k2[i])
-    end
-
-    θ_k3 = θ .+ 0.5 * dt .* k2
-    cal_order_param!(H_k3, Ψ_k3, Rn, K2, K3, θ_k3, params)
-    k3 = zeros(Float64, n)
-    @threads :dynamic for i in 1:n
-        k3[i] = dthdt(θ_k3[i], ω[i], H_k3[i], Ψ_k3[i])
-    end
-
-    θ_k4 = θ .+ dt .* k3
-    cal_order_param!(H_k4, Ψ_k4, Rn, K2, K3, θ_k4, params)
-    k4 = zeros(Float64, n)
-    @threads :dynamic for i in 1:n
-        k4[i] = dthdt(θ_k4[i], ω[i], H_k4[i], Ψ_k4[i])
+    if caches === nothing
+        H_k = zeros(Float64, n)
+        Ψ_k = zeros(Float64, n)
+        k1 = zeros(Float64, n)
+        k2 = zeros(Float64, n)
+        k3 = zeros(Float64, n)
+        k4 = zeros(Float64, n)
+        θ_tmp = zeros(Float64, n)
+    else
+        H_k, Ψ_k, k1, k2, k3, k4, θ_tmp = caches
     end
 
     @threads :dynamic for i in 1:n
-        θ[i] += (dt / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i])
+        @inbounds begin
+            k1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
+            θ_tmp[i] = θ[i] + 0.5 * dt * k1[i]
+        end
+    end
+
+    cal_order_param!(H_k, Ψ_k, Rn, K2, K3, θ_tmp, params)
+    @threads :dynamic for i in 1:n
+        @inbounds begin
+            k2[i] = dthdt(θ_tmp[i], ω[i], H_k[i], Ψ_k[i])
+            θ_tmp[i] = θ[i] + 0.5 * dt * k2[i]
+        end
+    end
+
+    cal_order_param!(H_k, Ψ_k, Rn, K2, K3, θ_tmp, params)
+    @threads :dynamic for i in 1:n
+        @inbounds begin
+            k3[i] = dthdt(θ_tmp[i], ω[i], H_k[i], Ψ_k[i])
+            θ_tmp[i] = θ[i] + dt * k3[i]
+        end
+    end
+
+    cal_order_param!(H_k, Ψ_k, Rn, K2, K3, θ_tmp, params)
+    @threads :dynamic for i in 1:n
+        @inbounds begin
+            k4[i] = dthdt(θ_tmp[i], ω[i], H_k[i], Ψ_k[i])
+            θ[i] += (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+        end
     end
 
     return θ
 end
 
+"""
+    evolve_RK4!(θ, ω, dt, time_steps, K2, K3, params, sumdeg2, Hn, Ψn, Rn, rk4_caches) -> Ravg
+
+Integrate the phases `θ` in place for `time_steps` RK4 steps at fixed (K2, K3)
+and return R = |Σ_i Σ_j A_ij e^{iθ_j}| / Σ_i k_i averaged over the second half.
+"""
+function evolve_RK4!(θ, ω, dt, time_steps, K2, K3, params, sumdeg2, Hn, Ψn, Rn, rk4_caches)
+    avg_start = time_steps ÷ 2 + 1
+    Rsum = 0.0
+
+    for t in 1:time_steps
+        cal_order_param!(Hn, Ψn, Rn, K2, K3, θ, params)
+        if t >= avg_start
+            Rsum += abs(sum(Rn)) / sumdeg2
+        end
+        RK4_step_fast!(θ, ω, dt, Hn, Ψn, Rn, K2, K3, params, rk4_caches)
+    end
+
+    return Rsum / (time_steps - avg_start + 1)
+end
+
 
 """
-    function Heun_step(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
+    Heun_step(θ, ω, dt, Hn, Ψn, Rn, K2, K3, params) -> θ
 
-Perform a Heun method (Improved Euler) integration step for the 3BD Kuramoto phases.
+One Heun (improved Euler) step of the 3-body Kuramoto model.
 """
 function Heun_step(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Vector{Float64}, Ψn::Vector{Float64}, Rn::Vector{Complex{Float64}}, K2::Float64, K3::Float64, params::Any)
     n, degree2, A2, degree3, A3 = params
@@ -579,137 +671,315 @@ function Heun_step(θ::Vector{Float64}, ω::Vector{Float64}, dt::Float64, Hn::Ve
     dth1 = zeros(Float64, n)
 
     @threads :dynamic for i in 1:n
-        dth1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
-        θ1[i] = θ[i] + dth1[i] * dt
+        @inbounds begin
+            dth1[i] = dthdt(θ[i], ω[i], Hn[i], Ψn[i])
+            θ1[i] = θ[i] + dth1[i] * dt
+        end
     end
 
     H1, Ψ1, R1 = cal_order_param(K2, K3, θ1, params)
     @threads :dynamic for i in 1:n
-        dth2 = dthdt(θ1[i], ω[i], H1[i], Ψ1[i])
-        θ[i] += 0.5 * (dth1[i] + dth2) * dt
+        @inbounds begin
+            dth2 = dthdt(θ1[i], ω[i], H1[i], Ψ1[i])
+            θ[i] += 0.5 * (dth1[i] + dth2) * dt
+        end
     end
 
     return θ
 end
 
+# FDA Helpers
 """
-    function R1_th_Int(init_val::Float64, K2::Float64, K3::Float64, params::Any)
+    fda_b(H)
 
-Numerically integrate mean-field order parameters for specific theoretical bounds in 2nd and 3rd order coupled networks.
+Frequency-distribution-approximation (FDA) locking factor for Lorentzian frequencies,
+b(H) = (√(H² + 1) - 1)/H = H/(√(H² + 1) + 1), written in the cancellation-free form.
+"""
+@inline fda_b(H::Float64) = H == 0.0 ? 0.0 : H/(sqrt(H*H + 1.0) + 1.0)
+
+"""
+    R1_th_Int(init_val, K2, K3, params) -> R
+
+FDA self-consistent order parameter. Solves Hᵢ = K2 Σⱼ Aᵢⱼ b(Hⱼ) + K3 Σ_(m,k) b(Hₘ)² b(Hₖ)
+by damped fixed-point iteration from Hᵢ = `init_val`·kᵢ, and returns R = Σᵢ Σⱼ Aᵢⱼ b(Hⱼ) / Σᵢ kᵢ.
 """
 function R1_th_Int(init_val::Float64, K2::Float64, K3::Float64, params::Any)
     n, degree2, A2, degree3, A3 = params
-    sumdeg2 = sum(degree2)
-    Qn = [init_val * degree2[i] for i in 1:n]
-    Qnc = zeros(Float64, 200, n)
-    Qnc[1, :] .= Qn
-    Rn = zeros(Float64, n)
-    for t in 2:200
-        @threads :dynamic for i in 1:n
-            r1 = 0.0
+    H = [init_val * Float64(degree2[i]) for i in 1:n]
+    Hnew = zeros(Float64, n)
+    b = zeros(Float64, n)
+    R2_arr = zeros(Float64, n)
+    
+    maxiter = 300
+    tol = 1e-10
+    damping = 0.7
+
+    for _ in 1:maxiter
+        @threads :static for i in 1:n
+            b[i] = fda_b(H[i])
+        end
+
+        @threads :static for i in 1:n
             r2 = 0.0
-            # Compute r1 for second-order interactions
-            for j in 1:degree2[i]
-                r1 += safe_div(safe_sqrt(Qnc[t-1, A2[i][j]]^2 + 1) - 1, Qnc[t-1, A2[i][j]])
+            r3 = 0.0
+
+            @inbounds for j in 1:degree2[i]
+                r2 += b[A2[i][j]]
             end
-            # Compute r2 for third-order interactions
-            for j in 1:Int32(size(A3[i], 1))
-                p1 = safe_div(safe_sqrt(Qnc[t-1, A3[i][j, 2]]^2 + 1) - 1, Qnc[t-1, A3[i][j, 2]])
-                p2 = safe_div(safe_sqrt(Qnc[t-1, A3[i][j, 1]]^2 + 1) - 1, Qnc[t-1, A3[i][j, 1]])
-                r2 += p1^2 * p2
+
+            @inbounds for j in 1:Int32(size(A3[i], 1))
+                m = A3[i][j, 1]
+                k = A3[i][j, 2]
+                r3 += b[m]^2 * b[k]
             end
-            # Update mean field parameter Qnc with calculated interactions
-            Qnc[t, i] = K2 * r1 + K3 * r2
-            Rn[i] = r1
+
+            R2_arr[i] = r2
+            Hnew[i] = K2*r2 + K3*r3
+        end
+
+        err = maximum(abs.(Hnew .- H))
+        scale = max(maximum(abs.(Hnew)), maximum(abs.(H)), 1e-8)
+        
+        @. H = damping*Hnew + (1.0-damping)*H
+        
+        if err <= tol*scale
+            break
         end
     end
-    # Compute R taking the sum normalized by degree
-    R = sum(Rn) / sum(degree2)
+
+    R = sum(R2_arr) / sum(degree2)
     return R
 end
 
+# HMF Helpers
 
 """
-    function R1_th_sum(init_val::Float64, K2::Float64, K3::Float64, omega::Vector{Float64}, params::Any)
+    hmf_fixed_point(alpha0, beta0, K2, K3, k, q) -> (alpha, beta)
 
-Iteratively evaluate theoretical synchronization manifolds summing specific frequency interaction thresholds.
+HMF fixed point from Eqs. (35)-(36), with k = realized dyadic degree and
+q = realized triadic hyperdegree (number of hyperedges incident on a node).
+`alpha` is the order parameter R.
+"""
+function hmf_fixed_point(alpha0::Float64, beta0::Float64, K2::Float64, K3::Float64,
+                         k::AbstractVector{<:Real}, q::AbstractVector{<:Real};
+                         maxiter::Int=3000, tol::Float64=1e-11, damping::Float64=0.6)
+    alpha = alpha0
+    beta = beta0
+
+    sumk = sum(k)
+    sumq = sum(q)
+
+    for _ in 1:maxiter
+        s1 = 0.0
+        s2 = 0.0
+
+        @inbounds for i in eachindex(k)
+            H = K2*alpha*k[i] + K3*beta*q[i]
+            b = fda_b(H)
+            s1 += k[i]*b
+            s2 += q[i]*b*b
+        end
+
+        alpha_new = s1 / sumk
+        beta_new = 2.0*alpha * s2 / sumq
+
+        err = max(abs(alpha_new - alpha), abs(beta_new - beta))
+        scale = max(abs(alpha_new), abs(beta_new), abs(alpha), abs(beta), 1e-8)
+
+        alpha = damping*alpha_new + (1.0-damping)*alpha
+        beta  = damping*beta_new  + (1.0-damping)*beta
+
+        err <= tol*scale && break
+    end
+
+    return alpha, beta
+end
+
+"""Eq. (53): HMF prediction for the onset of bistability."""
+function K3crit_HMF(k::AbstractVector{<:Integer}, q::AbstractVector{<:Integer})
+    kf = Float64.(k)
+    qf = Float64.(q)
+
+    k4  = mean(kf .^ 4)
+    q1  = mean(qf)
+    qk  = mean(qf .* kf)
+    qk2 = mean(qf .* kf .^ 2)
+
+    return k4 * q1^2 / (qk^2 * qk2)
+end
+
+"""
+    compute_HMF_sweep(degree2, degree3, K3s, K2sf; K2Crit_mean, K3Crit_mean, ...)
+        -> (D_hmf, R2f_all, R2b_all)
+
+Forward and backward HMF sweeps over the K2 grid `K2sf` (in units of K2Crit_mean)
+for every rK3 in `K3s` (in units of K3Crit_mean), using `hmf_fixed_point`.
+Threaded over K3. `R2f_all[ik3]` / `R2b_all[ik3]` are indexed like `K2sf`, and
+`D_hmf[ik3] = R2b_all[ik3] .- R2f_all[ik3]` is the hysteresis gap.
+
+Each K2 point starts from `init_f` (forward) or `init_b` (backward). With
+`continuation=true` it instead starts from the previous point's fixed point
+(forward steps are floored at `seed_min` so the incoherent state can leave α = 0).
+"""
+function compute_HMF_sweep(degree2::AbstractVector{<:Real}, degree3::AbstractVector{<:Real},
+                           K3s::AbstractVector, K2sf::AbstractVector;
+                           K2Crit_mean::Float64, K3Crit_mean::Float64,
+                           init_f::Float64=0.1, init_b::Float64=0.99,
+                           continuation::Bool=false, seed_min::Float64=1e-6,
+                           maxiter::Int=3000, tol::Float64=1e-11, damping::Float64=0.6)
+    n_k3 = length(K3s)
+    n_k2 = length(K2sf)
+
+    R2f_all = [zeros(Float64, n_k2) for _ in 1:n_k3]
+    R2b_all = [zeros(Float64, n_k2) for _ in 1:n_k3]
+    D_hmf = Vector{Vector{Float64}}(undef, n_k3)
+
+    @threads for ik3 in 1:n_k3
+        K3 = K3s[ik3] * K3Crit_mean
+        R2f = R2f_all[ik3]
+        R2b = R2b_all[ik3]
+
+        # Forward sweep (low -> high K2)
+        α, β = init_f, init_f
+        for ik2 in 1:n_k2
+            K2 = K2sf[ik2] * K2Crit_mean
+            # α = 0 is an exact fixed point, so keep a small seed for continuation
+            α, β = continuation ? (max(α, seed_min), max(β, seed_min)) : (init_f, init_f)
+            α, β = hmf_fixed_point(α, β, K2, K3, degree2, degree3;
+                                   maxiter=maxiter, tol=tol, damping=damping)
+            R2f[ik2] = α
+        end
+
+        # Backward sweep (high -> low K2)
+        α, β = init_b, init_b
+        for ik2 in n_k2:-1:1
+            K2 = K2sf[ik2] * K2Crit_mean
+            continuation || ((α, β) = (init_b, init_b))
+            α, β = hmf_fixed_point(α, β, K2, K3, degree2, degree3;
+                                   maxiter=maxiter, tol=tol, damping=damping)
+            R2b[ik2] = α
+        end
+
+        D_hmf[ik3] = R2b .- R2f
+    end
+
+    return D_hmf, R2f_all, R2b_all
+end
+
+# TAT Helpers
+"""
+    tat_second_harmonic(w, H)
+
+Second-harmonic contribution ⟨cos 2φ⟩ of an oscillator with frequency `w` in local field `H`
+(locked branch for |w| ≤ H, drifting branch otherwise), used by [`R1_th_sum`](@ref).
+"""
+@inline function tat_second_harmonic(w::Float64, H::Float64)
+    aw = abs(w)
+    if H <= 0.0
+        return 0.0
+    elseif aw <= H
+        x = w/H
+        return 1.0 - 2.0*x*x
+    else
+        return 1.0 - 2.0*aw/(sqrt(max(aw*aw - H*H, 0.0)) + aw)
+    end
+end
+
+"""
+    R1_th_sum(init_val, K2, K3, omega, params) -> R
+
+Self-consistent order parameter evaluated on the actual frequency sample `omega` (TAT).
+Solves Hᵢ = K2 Σⱼ Aᵢⱼ √(1-(ωⱼ/Hⱼ)²) + K3 Σ_(m,k) s₂(ωₘ,Hₘ) √(1-(ωₖ/Hₖ)²) by damped
+fixed-point iteration from Hᵢ = `init_val`·kᵢ, and returns the dyadic R normalised by Σᵢ kᵢ.
 """
 function R1_th_sum(init_val::Float64, K2::Float64, K3::Float64, omega::Vector{Float64}, params::Any)
     n, degree2, A2, degree3, A3 = params
-    Qn = [init_val * degree2[i] for i in 1:n]
-    Qnc = zeros(Float64, 200, n)
-    Qnc[1, :] .= Qn
-    Rn = zeros(Float64, n)
-    for t in 2:200
-        @threads for i in 1:n
-            r1 = 0.0
+    H = [init_val * Float64(degree2[i]) for i in 1:n]
+    Hnew = zeros(Float64, n)
+    firstharm = zeros(Float64, n)
+    secondharm = zeros(Float64, n)
+    R2_arr = zeros(Float64, n)
+    
+    maxiter = 10000
+    tol = 1e-15
+    damping = 0.7
+
+    for _ in 1:maxiter
+        @threads :static for i in 1:n
+            Hi = H[i]
+            wi = omega[i]
+            aw = abs(wi)
+
+            if Hi > 0.0 && aw <= Hi
+                x = wi/Hi
+                firstharm[i] = sqrt(max(1.0 - x*x, 0.0))
+            else
+                firstharm[i] = 0.0
+            end
+
+            secondharm[i] = tat_second_harmonic(wi, Hi)
+        end
+
+        @threads :static for i in 1:n
             r2 = 0.0
-            # Compute r1 for second-order interactions
-            for j in 1:degree2[i]
-                if abs(omega[A2[i][j]]) < Qnc[t-1, A2[i][j]]
-                    r1 += safe_sqrt(1 - safe_div(omega[A2[i][j]]^2, Qnc[t-1, A2[i][j]]^2))
-                end
+            r3 = 0.0
+
+            @inbounds for j in 1:degree2[i]
+                r2 += firstharm[A2[i][j]]
             end
-            for j in 1:Int32(size(A3[i], 1))
-                if abs(omega[A3[i][j, 1]]) < Qnc[t-1, A3[i][j, 1]] && abs(omega[A3[i][j, 2]]) < Qnc[t-1, A3[i][j, 2]]
-                    p1 = 1 - 2 * safe_div(omega[A3[i][j, 1]]^2, Qnc[t-1, A3[i][j, 1]]^2)
-                    p2 = safe_sqrt(1 - safe_div(omega[A3[i][j, 2]]^2, Qnc[t-1, A3[i][j, 2]]^2))
-                    r2 += p1 * p2
-                elseif abs(omega[A3[i][j, 1]]) > Qnc[t-1, A3[i][j, 1]] && abs(omega[A3[i][j, 2]]) < Qnc[t-1, A3[i][j, 2]]
-                    p1 = (2 * abs(omega[A3[i][j, 1]]) / Qnc[t-1, A3[i][j, 1]]^2) * (safe_sqrt(omega[A3[i][j, 1]]^2 - Qnc[t-1, A3[i][j, 1]]^2) - abs(omega[A3[i][j, 1]])) + 1
-                    p2 = safe_sqrt(1 - safe_div(omega[A3[i][j, 2]]^2, Qnc[t-1, A3[i][j, 2]]^2))
-                    r2 += p1 * p2
-                else
-                    r2 += 0.0
-                end
+
+            @inbounds for j in 1:Int32(size(A3[i], 1))
+                m = A3[i][j, 1]
+                k = A3[i][j, 2]
+                r3 += secondharm[m] * firstharm[k]
             end
-            # Update mean field parameter Qnc with calculated interactions
-            Qnc[t, i] = K2 * r1 + K3 * r2
-            Rn[i] = r1
+
+            R2_arr[i] = r2
+            Hnew[i] = K2*r2 + K3*r3
+        end
+
+        err = maximum(abs.(Hnew .- H))
+        scale = max(maximum(abs.(Hnew)), maximum(abs.(H)), 1e-8)
+        
+        @. H = damping*Hnew + (1.0-damping)*H
+        
+        if err <= tol*scale
+            break
         end
     end
-    # Compute R taking the sum normalized by degree
-    R = sum(Rn) / sum(degree2)
+
+    R = sum(R2_arr) / sum(degree2)
     return R
 end
 
 
-
 ########################### REWIRE FUNCTIONS ###########################
-"""
-    function Ω_cal(Un, i, j, k)
 
-Calculate a permutation-based combinatorial contribution of principal eigenvector entries for hyperedges.
-"""
-function Ω_cal(Un, i, j, k)
-    Ω = 0.0
-    all_perms = collect(permutations([i, j, k]))
-    for n in 1:length(all_perms)
-        perm = all_perms[n]
-        Ω += Un[perm[1]] * Un[perm[2]]^2 * Un[perm[3]]
-    end
-    return Ω
+"""Compute Ω contribution of a hyperedge (i,j,k) given eigenvector Un."""
+@inline function Ω_cal(Un, i, j, k)
+    ui = Un[i]
+    uj = Un[j]
+    uk = Un[k]
+    return ui * uj * uk * 2.0 * (ui + uj + uk)
 end
 
-"""
-    function update_A3!(A3, i, j, k)
-
-Update the 3rd order adjacency structure in-place for permutations of a hyperedge.
-"""
-function update_A3!(A3, i, j, k)
-    all_perms = collect(permutations([i, j, k]))
-    for n in 1:length(all_perms)
-        p = all_perms[n]
-        A3[p[1]] = vcat(A3[p[1]], reshape(Int16[p[2] p[3]], 1, 2))
-    end
+"""Push all 6 directed views of the hyperedge (i,j,k) into the adjacency lists."""
+@inline function update_A3!(A3_vec, i, j, k)
+    push!(A3_vec[i], (Int16(j), Int16(k)))
+    push!(A3_vec[i], (Int16(k), Int16(j)))
+    push!(A3_vec[j], (Int16(i), Int16(k)))
+    push!(A3_vec[j], (Int16(k), Int16(i)))
+    push!(A3_vec[k], (Int16(i), Int16(j)))
+    push!(A3_vec[k], (Int16(j), Int16(i)))
 end
 
 
 
 """
-    function generate_sets_adjusted(lst)
+    generate_sets_adjusted(lst) -> (sets, count_duplicates)
 
-Decompose a list of isolated stubs into balanced hyperedge groups, minimizing duplicate node assignments.
+Group leftover stubs `lst` into triples, preferring three distinct nodes. Returns the triples
+and how many of them had to repeat a node.
 """
 function generate_sets_adjusted(lst)
     # Count frequency of each number
@@ -753,36 +1023,38 @@ function generate_sets_adjusted(lst)
 end
 
 
-
 """
-    function rewire_3D_Ω(n, A3, degree3, Un, ways)
+    rewire_3D_Ω(n, A3, degree3, Un, ways) -> (new_A3, deg3p)
 
-Rewire an existing 3D network by swapping nodes between hyperedges while enforcing targeted structural optimization (increasing/decreasing critical limits).
+Rewire hyperedges to increase or decrease K3crit by swapping third vertices
+between randomly paired hyperedges when the Ω metric improves.
+
+`ways` must be `:decrease` or `:increase`.
 """
 function rewire_3D_Ω(n, A3, degree3, Un, ways)
-    hyperedges = []
+    hyperedges = Tuple{Int, Int, Int}[]
     for i in 1:n
-        for j in 1:size(A3[i], 1)
-            push!(hyperedges, sort([i, A3[i][j, 1], A3[i][j, 2]]))
+        @inbounds for j in 1:size(A3[i], 1)
+            a, b, c = Int(i), Int(A3[i][j, 1]), Int(A3[i][j, 2])
+            if a > b; a, b = b, a; end
+            if b > c; b, c = c, b; end
+            if a > b; a, b = b, a; end
+            push!(hyperedges, (a, b, c))
         end
     end
 
-    hyperedges = unique(hyperedges)
+    unique!(sort!(hyperedges))
     # Rewire the stubs
-    new_A3 = [Matrix{Int16}(undef, 0, 2) for _ in 1:n]
-    L = 0
-    if length(hyperedges) % 2 != 0
-        L = length(hyperedges) - 1
-    else
-        L = length(hyperedges)
-    end
+    new_A3_vec = [Tuple{Int16, Int16}[] for _ in 1:n]
+    L = length(hyperedges) - (length(hyperedges) % 2)
 
     shuffle!(hyperedges)
 
     for i in 1:2:L
 
-        shuffle!(hyperedges[i])
-        shuffle!(hyperedges[i+1])
+        # Tuples are immutable: shuffle a copy so any vertex can be the swapped one
+        hyperedges[i] = Tuple(shuffle!(collect(hyperedges[i])))
+        hyperedges[i+1] = Tuple(shuffle!(collect(hyperedges[i+1])))
 
         Ωi1 = Ω_cal(Un, hyperedges[i][1], hyperedges[i][2], hyperedges[i][3])
         Ωi2 = Ω_cal(Un, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i+1][3])
@@ -790,28 +1062,21 @@ function rewire_3D_Ω(n, A3, degree3, Un, ways)
         Ωf1 = Ω_cal(Un, hyperedges[i][1], hyperedges[i][2], hyperedges[i+1][3])
         Ωf2 = Ω_cal(Un, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i][3])
 
-
-
         if ways == :decrease #decrease K3crit
             if Ωi1 + Ωi2 > Ωf1 + Ωf2
-                # Rewire the stubs
-
-                update_A3!(new_A3, hyperedges[i][1], hyperedges[i][2], hyperedges[i][3])
-                update_A3!(new_A3, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i+1][3])
+                update_A3!(new_A3_vec, hyperedges[i][1], hyperedges[i][2], hyperedges[i][3])
+                update_A3!(new_A3_vec, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i+1][3])
             else
-                # Keep the original stubs
-                update_A3!(new_A3, hyperedges[i][1], hyperedges[i][2], hyperedges[i+1][3])
-                update_A3!(new_A3, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i][3])
+                update_A3!(new_A3_vec, hyperedges[i][1], hyperedges[i][2], hyperedges[i+1][3])
+                update_A3!(new_A3_vec, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i][3])
             end
         elseif ways == :increase #increase K3crit
             if Ωi1 + Ωi2 < Ωf1 + Ωf2
-                # Rewire the stubs
-                update_A3!(new_A3, hyperedges[i][1], hyperedges[i][2], hyperedges[i][3])
-                update_A3!(new_A3, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i+1][3])
+                update_A3!(new_A3_vec, hyperedges[i][1], hyperedges[i][2], hyperedges[i][3])
+                update_A3!(new_A3_vec, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i+1][3])
             else
-                # Keep the original stubs
-                update_A3!(new_A3, hyperedges[i][1], hyperedges[i][2], hyperedges[i+1][3])
-                update_A3!(new_A3, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i][3])
+                update_A3!(new_A3_vec, hyperedges[i][1], hyperedges[i][2], hyperedges[i+1][3])
+                update_A3!(new_A3_vec, hyperedges[i+1][1], hyperedges[i+1][2], hyperedges[i][3])
             end
         else
             error("Invalid way specified. Use :decrease or :increase.")
@@ -819,19 +1084,19 @@ function rewire_3D_Ω(n, A3, degree3, Un, ways)
     end
     # Handle the case where L is odd
     if length(hyperedges) % 2 != 0
-        update_A3!(new_A3, hyperedges[end][1], hyperedges[end][2], hyperedges[end][3])
+        update_A3!(new_A3_vec, hyperedges[end][1], hyperedges[end][2], hyperedges[end][3])
     end
 
-    deg3p = [Int(size(new_A3[i], 1) / 2) for i in 1:n]
+    deg3p = [Int(length(new_A3_vec[i]) ÷ 2) for i in 1:n]
     if all(degree3 .== deg3p)
         println("Preserve degree: ", all(degree3 .== deg3p))
     else
         idx_miss = findall(x -> x == 0, deg3p .== degree3)
         count_miss = abs.(deg3p .- degree3)[idx_miss]
         println("Missing degree: ", sum(count_miss))
-        stubs = []
+        stubs = Int[]
         for i in 1:length(idx_miss)
-            stubs = vcat(stubs, [idx_miss[i] for _ in 1:count_miss[i]])
+            append!(stubs, [idx_miss[i] for _ in 1:count_miss[i]])
         end
         println("Complete stubs: ", length(stubs) % 3)
 
@@ -840,10 +1105,11 @@ function rewire_3D_Ω(n, A3, degree3, Un, ways)
 
         for i in 1:length(limited_combinations)
             lc = limited_combinations[i]
-            update_A3!(new_A3, lc[1], lc[2], lc[3])
+            update_A3!(new_A3_vec, lc[1], lc[2], lc[3])
         end
-        deg3p = [Int(size(new_A3[i], 1) / 2) for i in 1:n]
+        deg3p = [Int(length(new_A3_vec[i]) ÷ 2) for i in 1:n]
     end
+    
+    new_A3 = vec_to_matrix(new_A3_vec, n)
     return new_A3, deg3p
 end
-

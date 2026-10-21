@@ -64,13 +64,6 @@ function one_part(id, rK3, γ)
         ω[i] = tan(π*(2i-n-1)/(n+1))
     end
 
-    Adj2 = zeros(Int32, n, n)
-    for i in 1:n
-        for j in 1:degree2[i]
-            Adj2[i, A2[i][j]] = 1
-        end
-    end
-
      λ, Un = Un_gen(n, degree2, A2)
     den = den_cal(n, degree3, A3, Un)
 
